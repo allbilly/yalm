@@ -3,8 +3,11 @@
 build/
 infer_cu_git_history
 profile_nsys
+Mistral-7B-Instruct-v0.2
+__pycache__/
+*/__pycache__/
 
-# profiling tools
+.tmp*
 *.yalm
 *.qdstrm
 *.sqlite
@@ -12,8 +15,5 @@ profile_nsys
 *.ncu-rep
 perf.data*
 *.gputrace/
-
 **/.DS_Store
-Mistral-7B-Instruct-v0.2
-.gitignore
-.tmp*
+

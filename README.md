@@ -1,8 +1,54 @@
+# YALM
+
+benchmark
+
+Re-run all engines and print the comparison table (RTX 3080, Mistral-7B-Instruct-v0.2):
+
 ```
-/usr/local/cuda-12.6/nsight-systems-2024.4.2/target-linux-x64/nsys profile --trace=cuda,nvtx,osrt --stats=true ./build/main tinyllama.yalm  -i "Q: What is meaning of life in the age of AGI, give a long ans" -d cuda > profile.out
+pip install -r requirements.txt
+.venv/bin/python mistral_bench.py
 ```
 
+HF weights: pass `--model mistralai/Mistral-7B-Instruct-v0.2` (resolved via `huggingface_hub` from `~/.cache/huggingface/hub`, no snapshot hash in config). Local dir: `--weights /path` or `MISTRAL_PATH`.
+
+Script: `mistral_bench.py` — benchmarks transformers (1 run), yalm, llama.cpp, calm, tinygrad (default 10 runs each), then prints the markdown comparison table. Tinygrad uses `tinygrad_mistral.py` (pip install tinygrad; no repo clone).
+
+Result on this machine (single run, 129 generated tokens, prompt "Q: What is the meaning of life?"):
+- throughput: **39.0 tok/s**
+- latency: 0.0256 s/tok
+- total: 3.31 s
+
+Comparison vs blog (Mistral-7B-Instruct-v0.2 fp16, 4k context, prompt "Q: What is the meaning of life?", 120 generated tokens):
+
+Card peak memory bandwidth: RTX 4090 = 1008 GB/s (24GB GDDR6X, 384-bit, 21.0 Gbps [videocardz](https://videocardz.net/nvidia-geforce-rtx-4090)). RTX 3080 = 760 GB/s (10GB GDDR6X, 320-bit, 19.0 Gbps [videocardz](https://videocardz.net/nvidia-geforce-rtx-3080)). For each engine, "BW used" = model size (14.48 GB fp16) × tok/s, i.e. the minimum bytes that must move through DRAM per token for a fully memory-bandwidth-bound decode.
+
+| Engine                       | RTX 4090 tok/s (blog) | 4090 % peak BW | RTX 3080 tok/s (this box) | 3080 % peak BW |
+| ---------------------------- | --------------------- | -------------- | ------------------------- | -------------- |
+| huggingface transformers    | 25.9                  | 37.2%          | 39.0                      | 74.3%          |
+| llama.cpp                    | 61.0                  | 87.6%          | 48.4 (10-run avg, stdev ~0.1) | 92.2%       |
+| calm                        | 66.0                  | 94.8%          | 48.9 (10-run avg, range 48.65-49.18) | 92.1% |
+| yalm                         | 63.8                  | 91.6%          | 44.6 (10-run avg, stdev ~0.04) | 84.2%      |
+| tinygrad                     | —                     | —              | 35.1 (10-run avg, stdev ~0.04) | 66.9%      |
+
+Commands run on this box:
+- huggingface transformers: `.venv/bin/python mistral_bench.py --engines transformers` (single run)
+- yalm: `./build/main mistral-7b-instruct-fp16.yalm -d cuda -m completion -i "Q: What is the meaning of life?" -n 120` (looped 10x, see /tmp/yalm_10runs.log)
+- llama.cpp: `~/llama.cpp/build/bin/llama-cli -m ~/mistral-7b-instruct-v0.2.fp16.gguf ...` The GGUF was converted from HF safetensors in the hub cache.
+- calm: `~/calm/build/run ~/.cache/mistral-7b-instruct.fp16.calm -c 4096 -n 120 -i "Q: What is the meaning of life?"` (looped 10x, see /tmp/calm_10runs.log). The .calm file at `~/.cache` was pre-converted; on this CPU, calm builds and runs fine despite the blog's footnote 9 (which I think applies only to a different machine).
+- tinygrad: `BEAM=8 .venv/bin/python tinygrad_mistral.py --count 120` (pip install tinygrad; no repo clone)
+
+Notes:
+- Ranking on this 3080: **calm > llama.cpp > yalm > transformers > tinygrad** (see table). On the blog 4090, llama.cpp and yalm swap places; calm still leads.
+- All native engines are stable once warmed (stdev < 0.5 tok/s). tinygrad is unoptimized fp16 + naive attention; `BEAM=8` helps but it still trails transformers on this card.
+
+run profile
+```
+/usr/local/cuda-12.6/nsight-systems-2024.4.2/target-linux-x64/nsys profile --trace=cuda,nvtx,osrt --stats=true ./build/main tinyllama.yalm  -i "Q: What is meaning of life in the age of AGI, give a long ans" -d cuda > profile.out
+
+
+
 ===============
+Original README.md
 
 yalm (Yet Another Language Model) is an LLM inference implementation in C++/CUDA, using no libraries except to load and save frozen LLM weights.
 - This project is intended as an **educational exercise** in performance engineering and LLM inference implementation. 

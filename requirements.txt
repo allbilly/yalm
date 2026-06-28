@@ -1,4 +1,7 @@
-# convert.py
 safetensors
 torch
 numpy
+tinygrad>=0.13.0
+sentencepiece
+transformers
+huggingface_hub
