@@ -1,8 +1,12 @@
 # build intermediates
 .vscode/
 build/
+infer_cu_git_history
+profile_nsys
 
 # profiling tools
+*.yalm
+*.qdstrm
 *.sqlite
 *.nsys-rep
 *.ncu-rep
@@ -10,3 +14,6 @@ perf.data*
 *.gputrace/
 
 **/.DS_Store
+Mistral-7B-Instruct-v0.2
+.gitignore
+.tmp*

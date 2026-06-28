@@ -1,5 +1,6 @@
 Andrew Chan
 Contents
+(Top)
 1. Recap: LLM architectures and inference
         1.1 Inference overview
         1.2 Bottlenecks and benchmarks
@@ -13,6 +14,7 @@ Contents
         3.4 Attention and long context generation
         3.5 KV quantization and compiler gotchas
 4. What’s next
+(Comments)
 Fast LLM Inference From Scratch
 Pushing single-GPU inference throughput to the edge without libraries
 Dec. 12, 2024
@@ -838,7 +840,7 @@ half2 v01_2; float att_2;
 /* ... SNIP ... */
 half2 v01_15; float att_15;
 int t = warp_id;
-for (int ctr = 0; ctr < seq_len / t_stride; t += t_stride, ctr++) {
+for (int ctr = 0; ctr < seq_len / t_stride - UNROLL + 1; t += t_stride, ctr++) {
   int ctr_mod = ctr % UNROLL;
   if (ctr_mod == 0) {
     // prefetch every UNROLL iterations
@@ -961,3 +963,4 @@ With number of threads tuned.
 See appendix for benchmark code. For some reason, this was the highest variance of all. Shown are a best of 3 run.
 An even better solution might be to do a rolling prefetch using pipeline instructions. See the NVIDIA blog post linked above for more.
 This is often done during training, where we have large batches of activations that must be kept around for gradient computation in all layers. For single-batch inference it is less beneficial especially as we can reuse tensors between layers.
+

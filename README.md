@@ -1,3 +1,9 @@
+```
+/usr/local/cuda-12.6/nsight-systems-2024.4.2/target-linux-x64/nsys profile --trace=cuda,nvtx,osrt --stats=true ./build/main tinyllama.yalm  -i "Q: What is meaning of life in the age of AGI, give a long ans" -d cuda > profile.out
+```
+
+===============
+
 yalm (Yet Another Language Model) is an LLM inference implementation in C++/CUDA, using no libraries except to load and save frozen LLM weights.
 - This project is intended as an **educational exercise** in performance engineering and LLM inference implementation. 
 - The codebase therefore emphasizes documentation, whether external or in comments, scientific understanding of optimizations, and readability where possible. 
