@@ -1,0 +1,6 @@
+# vLLM for mistral_bench.py / vllm_mistral.py
+# Install (Python 3.12, separate from yalm .venv):
+#   uv venv --python 3.12 ~/.cache/uv/environments-v2/vllm-bench/.venv
+#   uv pip install --python ~/.cache/uv/environments-v2/vllm-bench/.venv/bin/python -r requirements-vllm.txt
+vllm
+ninja

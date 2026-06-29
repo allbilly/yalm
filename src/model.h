@@ -11,6 +11,11 @@
 
 constexpr int KV_SINKS = 2;
 
+// calm-style 16-element K tiling: head_dim chunks of 16 × seq_len positions
+inline int k_cache_idx(int hi, int t, int max_seq_len) {
+  return (hi / 16) * (16 * max_seq_len) + t * 16 + (hi % 16);
+}
+
 enum class ActivationType {
   GELU,
   SILU,
@@ -23,7 +28,17 @@ enum class LayerNormType {
 enum class Device {
   CPU,
   CUDA,
+  CUDA_COOP,
+  CUDA_CUBLAS,
+  CUDA_CUBLASLT,
+  CUDA_CUDNN,
+  CUDA_CUTILE,
 };
+
+inline bool device_uses_libgemm(Device d) {
+  return d == Device::CUDA_CUBLAS || d == Device::CUDA_CUBLASLT
+      || d == Device::CUDA_CUDNN || d == Device::CUDA_CUTILE;
+}
 
 enum class InferenceMode {
   HYDRATE_KV_CACHE, // only hydrate the KV cache and don't compute output logits
@@ -107,6 +122,11 @@ struct InferenceState {
   float* logits() const { return _logits; }
 
   void cuda();
+  void cuda_coop();
+  void cuda_cublas();
+  void cuda_cublaslt();
+  void cuda_cudnn();
+  void cuda_cutile();
   Device device() const { return _device; }
   cudaStream_t stream() const { return _stream; }
   InferenceMode mode() const { return _mode; }
@@ -215,6 +235,11 @@ private:
     int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
     int kv_len          // number of tokens in the kv cache that we will attend over
   ) const;
+  template <typename T>
+  void _block_cuda_lib(
+    InferenceState& s,
+    int pos, int kv_sink, int kv_pos, int kv_len
+  ) const;
 
   int _layer_i = 0;
 
@@ -239,8 +264,8 @@ private:
   void* _moegate = nullptr; // (n_experts?, dim)
 
   // kv cache
-  f16_t* _key_cache = nullptr;   // (seq_len, n_kv_heads * head_dim)
-  f16_t* _value_cache = nullptr; // (seq_len, n_kv_heads * head_dim)
+  f16_t* _key_cache = nullptr;   // (n_kv_heads, head_dim, max_seq_len) 16-tiled K
+  f16_t* _value_cache = nullptr; // (n_kv_heads, head_dim, max_seq_len)
 };
 
 struct Model {
@@ -259,10 +284,17 @@ struct Model {
   
   void forward(InferenceState& s, int token, int pos, InferenceMode mode = InferenceMode::OUTPUT_LOGITS);
   void cuda();
+  void cuda_coop();
+  void cuda_cublas();
+  void cuda_cublaslt();
+  void cuda_cudnn();
+  void cuda_cutile();
 
 private:
   void _forward_cpu(InferenceState& s, int token, int pos, InferenceMode mode);
   void _forward_cuda(InferenceState& s, int token, int pos, InferenceMode mode);
+  void _forward_cuda_coop(InferenceState& s, int token, int pos, InferenceMode mode);
+  void _forward_cuda_lib(InferenceState& s, int token, int pos, InferenceMode mode);
   void _forward_cuda_build_graph(InferenceState& s, int token, int pos, InferenceMode mode);
   void _copy_embedding(InferenceState& s, int token);
 
@@ -297,26 +329,27 @@ void attn(
   float* xout,    // (dim,) - output vector
   float* atth,    // (kv_len,) - scratch space to hold attention scores of the sequence
   float* qh,      // (head_dim,) - query vector for this head
-  f16_t* kh,      // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
-  f16_t* vh,      // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
+  f16_t* kh,      // (head_dim, max_seq_len) slice for one kv head
+  f16_t* vh,      // (head_dim, max_seq_len) slice for one kv head
   int head_dim,   // size of the "key-space"
   int n_kv_heads, // number of kv heads, can be < n_heads (1 is MultiQueryAttention, >1 is GroupedQueryAttention)
+  int max_seq_len,// V-cache seq dimension (calm-style transpose)
   int kv_len      // number of tokens of the sequence we will attend over
 );
 
 void mha_cpu(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
-  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
-  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* kb,    // (n_kv_heads, head_dim, max_seq_len)
+  f16_t* vb,    // (n_kv_heads, head_dim, max_seq_len)
   float* q,     // (n_heads, head_dim)
   int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
 );
 void mha_cuda(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
-  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
-  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* kb,    // (n_kv_heads, head_dim, max_seq_len)
+  f16_t* vb,    // (n_kv_heads, head_dim, max_seq_len)
   float* q,     // (n_heads, head_dim)
   int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
 );

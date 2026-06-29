@@ -219,18 +219,18 @@ void attn(
   float* xout,    // (dim,) - output vector
   float* atth,    // (kv_len,) - scratch space to hold attention scores of the sequence
   float* qh,      // (head_dim,) - query vector for this head
-  f16_t* kh,      // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
-  f16_t* vh,      // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
+  f16_t* kh,      // (head_dim, max_seq_len) slice for one kv head
+  f16_t* vh,      // (head_dim, max_seq_len) slice for one kv head
   int head_dim,   // size of the "key-space"
   int n_kv_heads, // number of kv heads, can be < n_heads (1 is MultiQueryAttention, >1 is GroupedQueryAttention)
+  int max_seq_len,// K/V cache seq dimension
   int kv_len      // number of tokens of the sequence we will attend over
 ) {
-  int kv_stride = n_kv_heads * head_dim; // stride per token in this kv head
   // calculate attention scores as dot products of q and k
   for (int t = 0; t < kv_len; ++t) {
     float score = 0.0f;
     for (int i = 0; i < head_dim; ++i) {
-      score += qh[i] * half_to_float(kh[t * kv_stride + i]);
+      score += qh[i] * half_to_float(kh[k_cache_idx(i, t, max_seq_len)]);
     }
     score /= sqrtf(head_dim);
     atth[t] = score;
@@ -243,7 +243,7 @@ void attn(
   for (int i = 0; i < head_dim; ++i) {
     float vi = 0.0f;
     for (int t = 0; t < kv_len; ++t) {
-      vi += atth[t] * half_to_float(vh[t * kv_stride + i]);
+      vi += atth[t] * half_to_float(vh[i * max_seq_len + t]);
     }
     xout[i] = vi;
   }
@@ -298,8 +298,10 @@ void Block::_block_cpu(
   f16_t* vb = value_cache();
   // update kv cache
   for (int i = 0; i < kv_dim; ++i) {
-    kb[kv_pos * kv_dim + i] = float_to_half(s.k()[i]);
-    vb[kv_pos * kv_dim + i] = float_to_half(s.v()[i]);
+    int g = i / c.head_dim;
+    int j = i % c.head_dim;
+    kb[g * c.head_dim * c.max_seq_len + k_cache_idx(j, kv_pos, c.max_seq_len)] = float_to_half(s.k()[i]);
+    vb[g * c.head_dim * c.max_seq_len + j * c.max_seq_len + kv_pos] = float_to_half(s.v()[i]);
   }
 
   // Sink tokens remain untouched while the rest of the KV cache is incrementally 
@@ -308,13 +310,17 @@ void Block::_block_cpu(
   // forward by 1. See https://arxiv.org/abs/2309.17453 for more.
   for (int r = 0; r < kv_sink; r++) {
     for (int i = 0; i < kv_dim; ++i) {
-      s.k()[i] = half_to_float(kb[r * kv_dim + i]);
+      int g = i / c.head_dim;
+      int j = i % c.head_dim;
+      s.k()[i] = half_to_float(kb[g * c.head_dim * c.max_seq_len + k_cache_idx(j, r, c.max_seq_len)]);
     }
 
     rope(s.k(), kv_dim, c.head_dim, 1, c.rope_theta, c.rotary_dim);
 
     for (int i = 0; i < kv_dim; i++) {
-      kb[r * kv_dim + i] = float_to_half(s.k()[i]);
+      int g = i / c.head_dim;
+      int j = i % c.head_dim;
+      kb[g * c.head_dim * c.max_seq_len + k_cache_idx(j, r, c.max_seq_len)] = float_to_half(s.k()[i]);
     }
   }
 
@@ -323,10 +329,10 @@ void Block::_block_cpu(
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < c.n_heads; h++) {
-    int kv_head_offset = (h / q_per_kv_head) * c.head_dim;
-    f16_t* kh = kb + kv_head_offset;
-    f16_t* vh = vb + kv_head_offset;
-    attn(s.xb2(h), s.att(h), s.q(h), kh, vh, c.head_dim, c.n_kv_heads, kv_len);
+    int g = h / q_per_kv_head;
+    f16_t* kh = kb + g * c.head_dim * c.max_seq_len;
+    f16_t* vh = vb + g * c.head_dim * c.max_seq_len;
+    attn(s.xb2(h), s.att(h), s.q(h), kh, vh, c.head_dim, c.n_kv_heads, c.max_seq_len, kv_len);
   }
 
   // final matmul to get output of the attention, using `hb` as temp storage
@@ -388,8 +394,8 @@ void Block::_block_cpu(
 void mha_cpu(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
-  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
-  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* kb,    // (n_kv_heads, head_dim, max_seq_len)
+  f16_t* vb,    // (n_kv_heads, head_dim, max_seq_len)
   float* q,     // (n_heads, head_dim)
   int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
 ) {
@@ -398,12 +404,12 @@ void mha_cpu(
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < n_heads; h++) {
-    int kv_head_offset = (h / q_per_kv_head) * head_dim;
-    f16_t* kh = kb + kv_head_offset;
-    f16_t* vh = vb + kv_head_offset;
+    int g = h / q_per_kv_head;
+    f16_t* kh = kb + g * head_dim * max_seq_len;
+    f16_t* vh = vb + g * head_dim * max_seq_len;
     attn(
       xout + head_dim * h, att + max_seq_len * h, q + head_dim * h, 
-      kh, vh, head_dim, n_kv_heads, kv_len
+      kh, vh, head_dim, n_kv_heads, max_seq_len, kv_len
     );
   }
 }

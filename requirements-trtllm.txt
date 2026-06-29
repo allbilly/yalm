@@ -1,0 +1,9 @@
+# TensorRT-LLM for trtllm_mistral.py / mistral_bench.py --engines tensorrt-llm
+#
+# Docker (recommended on this box):
+#   docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19
+#   # needs nvidia-container-toolkit — see README
+#   ./trtllm_docker_bench.sh --count 120
+#
+# Native pip (platform/CUDA specific):
+#   https://nvidia.github.io/TensorRT-LLM/installation.html

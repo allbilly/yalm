@@ -8,6 +8,9 @@
 
 #include "fmt/format.h"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "codec.h"
 #include "model.h"
 #include "sampler.h"
@@ -19,7 +22,7 @@ void error_usage() {
   fprintf(stderr, "Example: main model.yalm -i \"Q: What is the meaning of life?\"\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -h Display this help message\n");
-  fprintf(stderr, "  -d [cpu,cuda] which device to use (default - cuda)\n");
+  fprintf(stderr, "  -d [cpu,cuda,...,tensorrt-llm] which device (default cuda)\n");
   fprintf(stderr, "  -m [completion,passkey,perplexity] which mode to run in (default - completion)\n");
   fprintf(stderr, "  -T <int> sliding window context length (0 - max)\n");
   fprintf(stderr, "\n");
@@ -51,6 +54,70 @@ void debug_tensors(Config& c) {
 }
 #endif
 
+static void setup_cuda(Model& model, InferenceState& state, const std::string& device) {
+  if (device == "cpu") {
+    return;
+  }
+  if (device == "cuda-cublas") {
+    std::cout << "Using CUDA with cuBLAS linear layers" << std::endl;
+    model.cuda_cublas();
+    state.cuda_cublas();
+  } else if (device == "cuda-cublaslt") {
+    std::cout << "Using CUDA with cuBLASLt linear layers" << std::endl;
+    model.cuda_cublaslt();
+    state.cuda_cublaslt();
+  } else if (device == "cuda-cudnn") {
+    std::cout << "Using CUDA with cuDNN linear layers" << std::endl;
+    model.cuda_cudnn();
+    state.cuda_cudnn();
+  } else if (device == "cuda-cutile") {
+    std::cout << "Using CUDA with tile matvec linear layers" << std::endl;
+    model.cuda_cutile();
+    state.cuda_cutile();
+  } else if (device == "cuda-coop") {
+    std::cout << "Using CUDA cooperative backend" << std::endl;
+    model.cuda_coop();
+    state.cuda_coop();
+  } else {
+    std::cout << "Using CUDA" << std::endl;
+    model.cuda();
+    state.cuda();
+  }
+}
+
+static int run_tensorrt_llm(
+  const std::string& prompt, int num_steps, float temperature
+) {
+  const char* python = std::getenv("YALM_PYTHON");
+  if (!python || !python[0]) {
+    python = ".venv/bin/python";
+  }
+  char tmp[] = "/tmp/yalm_trtllm_prompt_XXXXXX";
+  int fd = mkstemp(tmp);
+  if (fd < 0) {
+    std::cerr << "Error: could not create temp prompt file" << std::endl;
+    return 1;
+  }
+  if (write(fd, prompt.data(), prompt.size()) != static_cast<ssize_t>(prompt.size())) {
+    close(fd);
+    std::cerr << "Error: could not write temp prompt file" << std::endl;
+    return 1;
+  }
+  close(fd);
+
+  std::string cmd = fmt::format(
+    "{} trtllm_mistral.py --prompt-file {} --count {} --temperature {}",
+    python, tmp, num_steps, temperature
+  );
+  std::cout << "Using TensorRT-LLM (via " << python << ")" << std::endl;
+  int st = std::system(cmd.c_str());
+  unlink(tmp);
+  if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    return 1;
+  }
+  return 0;
+}
+
 void run_completion(
   const std::string& checkpoint_path,
   const std::string& device,
@@ -72,11 +139,7 @@ void run_completion(
     // `-n 0` means use the full context length
     num_steps = model.config->max_seq_len;
   }
-  if (device == "cuda") {
-    std::cout << "Using CUDA" << std::endl;
-    model.cuda();
-    state.cuda();
-  }
+  setup_cuda(model, state, device);
 
   // Do one inference as warmup.
   // On CPU, this ensures all tensors are loaded into memory via mmap.
@@ -162,11 +225,7 @@ void run_perplexity(
 
   std::cout << "Model active bytes with full context window: " << model.config->active_bytes(model.config->max_seq_len) << std::endl;
 
-  if (device == "cuda") {
-    std::cout << "Using CUDA" << std::endl;
-    model.cuda();
-    state.cuda();
-  }
+  setup_cuda(model, state, device);
 
   // Do one inference as warmup.
   // On CPU, this ensures all tensors are loaded into memory via mmap.
@@ -250,11 +309,7 @@ void run_passkey(
 
   std::cout << "Model active bytes with full context window: " << model.config->active_bytes(model.config->max_seq_len) << std::endl;
 
-  if (device == "cuda") {
-    std::cout << "Using CUDA" << std::endl;
-    model.cuda();
-    state.cuda();
-  }
+  setup_cuda(model, state, device);
 
   // Do one inference as warmup.
   // On CPU, this ensures all tensors are loaded into memory via mmap.
@@ -388,7 +443,19 @@ int main(int argc, char* argv[]) {
       device = argv[i + 1];
       if (std::string("cpu").starts_with(device)) {
         device = "cpu";
-      } else if (std::string("cuda").starts_with(device)) {
+      } else if (device == "cuda-cublaslt" || device == "cublaslt") {
+        device = "cuda-cublaslt";
+      } else if (device == "cuda-cublas" || device == "cublas") {
+        device = "cuda-cublas";
+      } else if (device == "cuda-cudnn" || device == "cudnn") {
+        device = "cuda-cudnn";
+      } else if (device == "cuda-cutile" || device == "cutile") {
+        device = "cuda-cutile";
+      } else if (device == "cuda-coop" || device == "coop") {
+        device = "cuda-coop";
+      } else if (device == "tensorrt-llm" || device == "trtllm") {
+        device = "tensorrt-llm";
+      } else if (device == "cuda" || device == "gpu") {
         device = "cuda";
       } else {
         error_usage();
@@ -456,6 +523,14 @@ int main(int argc, char* argv[]) {
       std::cerr << "Error: passkey position must be between 0 and " << n_junk - 1 << std::endl;
       return 1;
     }
+  }
+
+  if (device == "tensorrt-llm") {
+    if (mode != "completion") {
+      std::cerr << "Error: tensorrt-llm backend supports completion mode only" << std::endl;
+      return 1;
+    }
+    return run_tensorrt_llm(prompt, num_steps, temperature);
   }
 
   if (mode == "completion") {

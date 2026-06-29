@@ -1,5 +1,8 @@
 # YALM
 
+TODO
+- make 3d plot
+
 benchmark
 
 Re-run all engines and print the comparison table (RTX 3080, Mistral-7B-Instruct-v0.2):
@@ -24,22 +27,154 @@ Card peak memory bandwidth: RTX 4090 = 1008 GB/s (24GB GDDR6X, 384-bit, 21.0 Gbp
 
 | Engine                       | RTX 4090 tok/s (blog) | 4090 % peak BW | RTX 3080 tok/s (this box) | 3080 % peak BW |
 | ---------------------------- | --------------------- | -------------- | ------------------------- | -------------- |
-| huggingface transformers    | 25.9                  | 37.2%          | 39.0                      | 74.3%          |
-| llama.cpp                    | 61.0                  | 87.6%          | 48.4 (10-run avg, stdev ~0.1) | 92.2%       |
-| calm                        | 66.0                  | 94.8%          | 48.9 (10-run avg, range 48.65-49.18) | 92.1% |
-| yalm                         | 63.8                  | 91.6%          | 44.6 (10-run avg, stdev ~0.04) | 84.2%      |
+| huggingface transformers    | 25.9                  | 37.2%          | —                         | —              |
+| transformers (torch.compile) | —                     | —              | **39.8** (single run)     | **75.8%**      |
+| llama.cpp                    | 61.0                  | 87.6%          | ~46.5 long / ~48.4 short  | ~88–92%        |
+| calm                        | 66.0                  | 94.8%          | **~48.9** (matched long)  | **~93%**       |
+| yalm (`-d cuda`)             | 63.8                  | 91.6%          | **~49.3 short / ~48.9 long** | **~93%**    |
+| yalm (`-d cuda-coop`)        | —                     | —              | **~49.3 short / ~48.9 long** | **~93%**    |
+| yalm (`-d cuda-cublas`)      | —                     | —              | **~43**                   | ~82%           |
+| yalm (`-d cuda-cudnn`)       | —                     | —              | **~43**                   | ~82%           |
+| yalm (`-d cuda-cutile`)      | —                     | —              | **~45**                   | ~87%           |
+| vllm                         | —                     | —              | (see setup)               | —              |
+| sglang                       | —                     | —              | (see setup)               | —              |
+| tensorrt-llm                 | —                     | —              | (requires install)        | —              |
 | tinygrad                     | —                     | —              | 35.1 (10-run avg, stdev ~0.04) | 66.9%      |
 
-Commands run on this box:
-- huggingface transformers: `.venv/bin/python mistral_bench.py --engines transformers` (single run)
-- yalm: `./build/main mistral-7b-instruct-fp16.yalm -d cuda -m completion -i "Q: What is the meaning of life?" -n 120` (looped 10x, see /tmp/yalm_10runs.log)
-- llama.cpp: `~/llama.cpp/build/bin/llama-cli -m ~/mistral-7b-instruct-v0.2.fp16.gguf ...` The GGUF was converted from HF safetensors in the hub cache.
-- calm: `~/calm/build/run ~/.cache/mistral-7b-instruct.fp16.calm -c 4096 -n 120 -i "Q: What is the meaning of life?"` (looped 10x, see /tmp/calm_10runs.log). The .calm file at `~/.cache` was pre-converted; on this CPU, calm builds and runs fine despite the blog's footnote 9 (which I think applies only to a different machine).
-- tinygrad: `BEAM=8 .venv/bin/python tinygrad_mistral.py --count 120` (pip install tinygrad; no repo clone)
+**RTX 3080 decode (Mistral-7B fp16, Jun 2026, after Fix #3–#6 + `cuda-coop`):**
 
-Notes:
-- Ranking on this 3080: **calm > llama.cpp > yalm > transformers > tinygrad** (see table). On the blog 4090, llama.cpp and yalm swap places; calm still leads.
-- All native engines are stable once warmed (stdev < 0.5 tok/s). tinygrad is unoptimized fp16 + naive attention; `BEAM=8` helps but it still trails transformers on this card.
+| Context | Prompt | yalm `-d cuda` | yalm `-d cuda-coop` | calm | llama.cpp |
+|---------|--------|---------------:|--------------------:|-----:|----------:|
+| Short | 120 tok decode | **~49.3** | **~49.3** | ~47.4 | ~46.5 |
+| Long | `long_prompt.txt` (~3202 prefill + 30 decode) | **~48.9** | **~48.9** | **~48.9** | ~46.5 |
+
+All three native CUDA paths (yalm graph, yalm coop, calm) are **within ~1%** on this box — near the ~52 tok/s memory roofline (760 GB/s ÷ 14.48 GB weights). nsys: one `kernel_forward` ≈ **20.4 ms**/token at kv≈3200 (`ref/nsys_logs/yalm_coop_long.nsys-rep`, `calm_long.nsys-rep`).
+
+**CUDA backends**
+
+| `-d` flag | What it runs |
+|-----------|----------------|
+| `cuda` (default) | Per-kernel CUDA graph (`fused_ffn`, `attn_fused`, …) |
+| `cuda-coop` | calm-style cooperative `kernel_forward` (one launch/token) |
+| `cuda-cublas` | Linear layers via cuBLAS `GemmEx`; custom attn/RoPE/norm |
+| `cuda-cublaslt` | Linear layers via cuBLASLt (falls back to GemmEx on matvec n=1) |
+| `cuda-cudnn` | Linear layers via cuDNN graph matmul (falls back to cuBLAS if unsupported) |
+| `cuda-cutile` | Linear layers via warp-tile matvec kernel (not NVIDIA cuTILE Python DSL) |
+| `tensorrt-llm` | NVIDIA TensorRT-LLM via `trtllm_mistral.py` (separate runtime; `.yalm` checkpoint unused) |
+| `cpu` | CPU reference |
+
+Library backends need `pip install -r requirements.txt` (cuDNN comes from the `nvidia-cudnn` wheel). TensorRT-LLM: see `requirements-trtllm.txt` and [install docs](https://nvidia.github.io/TensorRT-LLM/installation.html).
+
+**vLLM / SGLang**
+
+Use **separate uv venvs** — do not install into yalm's `.venv` (CUDA/PyTorch wheel conflicts). Run **one install at a time**. Python **3.12** recommended.
+
+**vLLM** ([install docs](https://docs.vllm.ai/en/stable/getting_started/installation/gpu/)):
+
+```
+uv venv --python 3.12 ~/.cache/uv/environments-v2/vllm-bench/.venv
+uv pip install --python ~/.cache/uv/environments-v2/vllm-bench/.venv/bin/python -r requirements-vllm.txt
+```
+
+`ninja` is required for FlashInfer JIT at first run — it must be on `PATH` (the venv `bin/` is prepended automatically by `mistral_bench.py`).
+
+On RTX 3080 10GB, `vllm_mistral.py` sets `max_model_len=4096` so fp16 weights (~14.5 GB) plus KV cache fit.
+
+Verify:
+
+```
+.venv/bin/python bench_engines.py vllm
+~/.cache/uv/environments-v2/vllm-bench/.venv/bin/python vllm_mistral.py --count 8
+```
+
+**SGLang** ([install docs](https://docs.sglang.io/docs/get-started/install)):
+
+```
+uv venv --python 3.12 ~/.cache/uv/environments-v2/sglang-bench/.venv
+uv pip install --python ~/.cache/uv/environments-v2/sglang-bench/.venv/bin/python -r requirements-sglang.txt
+```
+
+First install pulls large CUDA wheels (~2 GB); expect several minutes. `sglang_mistral.py` uses `context_length=4096` for the same 10GB VRAM reason.
+
+Verify:
+
+```
+.venv/bin/python bench_engines.py sglang
+~/.cache/uv/environments-v2/sglang-bench/.venv/bin/python sglang_mistral.py --count 8
+```
+
+**CUDA 12 hosts:** SGLang defaults to CUDA 13 wheels. If import or kernel load fails, follow the [CUDA 12 override steps](https://docs.sglang.io/docs/get-started/install) (`sglang-kernel` from `docs.sglang.ai/whl/cu129/`).
+
+**Docker (optional, for serving):** official images `vllm/vllm-openai` and `lmsysorg/sglang:latest-runtime` — see each project's Docker docs. The bench scripts here use in-process Python APIs, not the server containers.
+
+**TensorRT-LLM (Docker bench)**
+
+Image on this box: `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19`. GPU inside the container needs [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html):
+
+```
+# Ubuntu (summary — see NVIDIA docs for your distro)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+Verify GPU in container:
+
+```
+docker run --rm --gpus all nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19 \
+  python3 -c "import tensorrt_llm; print('ok')"
+```
+
+Benchmark (first run builds the TRT engine; can take several minutes):
+
+```
+chmod +x trtllm_docker_bench.sh
+./trtllm_docker_bench.sh --count 120
+.venv/bin/python mistral_bench.py --engines tensorrt-llm --trtllm-docker --count 120
+```
+
+**SGLang timing:** `sglang_mistral.py` runs one untimed full decode before the timed run (`--graph-warmup`, default on) so CUDA graph capture is excluded from tok/s.
+
+Bench via `mistral_bench.py` (auto-finds uv venvs under `~/.cache/uv`):
+
+```
+.venv/bin/python mistral_bench.py --engines vllm --count 120
+.venv/bin/python mistral_bench.py --engines sglang --count 120
+```
+
+Override Python if needed: `--vllm-python PATH` / `--sglang-python PATH`.
+
+Example:
+```
+./build/main mistral-7b-instruct-fp16.yalm -d tensorrt-llm -m completion -i "Q: What is the meaning of life?" -n 120
+./build/main mistral-7b-instruct-fp16.yalm -d cuda-cudnn -m completion -i "Q: What is the meaning of life?" -n 120
+./build/main mistral-7b-instruct-fp16.yalm -d cuda-coop -m completion -f long_prompt.txt -n 30
+```
+
+Full kernel comparison, bottleneck analysis, and per-kernel timing breakdown from `nsys`/`-bk` tests: see [`results.md`](results.md).
+Commands run on this box:
+- transformers (torch.compile): `.venv/bin/python mistral_bench.py --engines "huggingface transformers" --count 120 --runs 1`
+- tensorrt-llm: `./trtllm_docker_bench.sh --count 120` or `.venv/bin/python mistral_bench.py --engines tensorrt-llm --trtllm-docker --count 120`
+- vllm: `.venv/bin/python mistral_bench.py --engines vllm --count 120` (uses `vllm_mistral.py`; auto-finds uv venv)
+- sglang: `.venv/bin/python mistral_bench.py --engines sglang --count 120` (uses `sglang_mistral.py`)
+- yalm graph: `./build/main mistral-7b-instruct-fp16.yalm -d cuda -m completion -i "Q: What is the meaning of life?" -n 120`
+- yalm library backends: `-d cuda-cublas`, `-d cuda-cudnn`, `-d cuda-cutile`, …
+- yalm coop: `./build/main mistral-7b-instruct-fp16.yalm -d cuda-coop -m completion -f long_prompt.txt -n 30`
+- llama.cpp: `~/llama.cpp/build/bin/llama-cli -m ~/mistral-7b-instruct-v0.2.fp16.gguf ...`
+- calm long (matched workload): `calm/build/run ~/.cache/mistral-7b-instruct.fp16.calm -c 4096 -n 3232 -i - < long_prompt.txt` (3202 prompt + 30 decode steps; **not** `-n 30` alone)
+- tinygrad: `BEAM=8 .venv/bin/python tinygrad_mistral.py --count 120`
+
+- Ranking on this 3080 (Jun 2026): **yalm `-d cuda` ≈ calm > library backends > llama.cpp > transformers (torch.compile)**. Custom kernels ~49 tok/s; library paths ~43–45 tok/s. See [`results.md`](results.md) §28.
+
+TensorRT-LLM
+```
+docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19
+```
 
 run profile
 ```
@@ -93,7 +228,7 @@ Usage:   main <checkpoint> [options]
 Example: main model.yalm -i "Q: What is the meaning of life?" -m c
 Options:
   -h Display this help message
-  -d [cpu,cuda] which device to use (default - cuda)
+  -d [cpu,cuda,cuda-coop,cuda-cublas,cuda-cublaslt,cuda-cudnn,cuda-cutile] which device to use (default - cuda)
   -m [completion,passkey,perplexity] which mode to run in (default - completion)
   -T <int> sliding window context length (0 - max)
 

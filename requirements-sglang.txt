@@ -1,0 +1,6 @@
+# SGLang for mistral_bench.py / sglang_mistral.py
+# Install (Python 3.12, separate from yalm .venv):
+#   uv venv --python 3.12 ~/.cache/uv/environments-v2/sglang-bench/.venv
+#   uv pip install --python ~/.cache/uv/environments-v2/sglang-bench/.venv/bin/python -r requirements-sglang.txt
+sglang
+ninja

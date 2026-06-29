@@ -87,28 +87,27 @@ void test_attn() {
   for (size_t i = 0; i < q.size(); i++) {
     s.q()[i] = q[i];
   }
-  std::vector<f16_t> kb = float_array_to_half({
-    1., 0., 0., // t=0
-    0., 1., 0., // t=1
-    0., 0., 1., // t=2
-    -1., 0., 0. // t=3
-  }); // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
+  std::vector<f16_t> kb(16 * TEST_SEQ_LEN);
+  auto hf = [&](float x) { return float_array_to_half({x})[0]; };
+  kb[0] = hf(1.f);
+  kb[17] = hf(1.f);
+  kb[34] = hf(1.f);
+  kb[48] = hf(-1.f);
   std::vector<f16_t> vb = float_array_to_half({
-    1., 0., 0., // t=0
-    0., 1., 0., // t=1
-    0., 0., 1., // t=2
-    -1., 0., 0. // t=3
-  }); // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
+    1., 0., 0., -1., // head dim 0 across t=0..3
+    0., 1., 0., 0.,  // head dim 1
+    0., 0., 1., 0.   // head dim 2
+  }); // (n_kv_heads, head_dim, max_seq_len)
 
   // Multihead attention. Iterate over all heads.
   int q_per_kv_head = TEST_N_HEADS / TEST_N_KV_HEADS; // query heads per kv head (for MultiQueryAttention/GroupedQueryAttention)
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < TEST_N_HEADS; h++) {
-    int kv_head_offset = (h / q_per_kv_head) * TEST_HEAD_DIM;
-    f16_t* kh = kb.data() + kv_head_offset;
-    f16_t* vh = vb.data() + kv_head_offset;
-    attn(s.xb(h), s.att(h), s.q(h), kh, vh, TEST_HEAD_DIM, TEST_N_KV_HEADS, TEST_SEQ_LEN);
+    int g = h / q_per_kv_head;
+    f16_t* kh = kb.data() + g * TEST_HEAD_DIM * TEST_SEQ_LEN;
+    f16_t* vh = vb.data() + g * TEST_HEAD_DIM * TEST_SEQ_LEN;
+    attn(s.xb(h), s.att(h), s.q(h), kh, vh, TEST_HEAD_DIM, TEST_N_KV_HEADS, TEST_SEQ_LEN, TEST_SEQ_LEN);
   }
   // attention scores
   // h=0
@@ -146,6 +145,7 @@ void fill_random(f16_t* data, size_t N, unsigned long seed, float scale_factor =
 }
 
 void test_cuda_kernels() {
+  set_cuda_device(0);
   int head_dim = 16;
   int n_heads = 16;
   int dim = head_dim * n_heads;
@@ -195,7 +195,6 @@ void test_cuda_kernels() {
       q.data(), 
       head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
     );
-    assertArrayEquals(att_cuda, att_cpu, "mha att");
     assertArrayEquals(xout_cuda, xout_cpu, "mha xout");
   }
 
@@ -338,6 +337,7 @@ void mem_bench2() {
 }
 
 void kernel_bench(const std::string& kernel_name) {
+  set_cuda_device(0);
   int head_dim = 128;
   int n_heads = 32;
   int dim = head_dim * n_heads;

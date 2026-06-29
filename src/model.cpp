@@ -1,5 +1,7 @@
 #include "model.h"
 
+#include "coop.h"
+#include "libgemm.h"
 #include "json.hpp"
 #include <algorithm>
 #include <array>
@@ -245,7 +247,12 @@ void Block::block(
   int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
   int kv_len          // number of tokens in the kv cache that we will attend over
 ) const {
-  if (_device == Device::CUDA) {
+  if (device_uses_libgemm(s.device())) {
+    if (_config->weight_dtype != DType::F16) {
+      assert(false && "library gemm backend supports fp16 weights only");
+    }
+    _block_cuda_lib<f16_t>(s, pos, kv_sink, kv_pos, kv_len);
+  } else if (_device == Device::CUDA) {
     switch (_config->weight_dtype) {
       case DType::F32: {
         _block_cuda<float>(s, pos, kv_sink, kv_pos, kv_len);
@@ -292,7 +299,7 @@ InferenceState::InferenceState(const std::shared_ptr<Config> config):
   _q = new float[config->n_heads * config->head_dim]();
   _k = new float[config->n_kv_heads * config->head_dim]();
   _v = new float[config->n_kv_heads * config->head_dim]();
-  _att = new float[config->n_heads * config->max_seq_len]();
+  _att = new float[config->n_heads * config->max_seq_len * 2]();
   _logits = new float[config->vocab_size]();
   _moe_weights = new float[config->n_experts]();
   _active_experts = new int[config->n_experts_active]();
@@ -346,11 +353,40 @@ void InferenceState::cuda() {
   _q = static_cast<float*>(upload_cuda(_q, _config->n_heads * _config->head_dim * sizeof(float)));
   _k = static_cast<float*>(upload_cuda(_k, _config->n_kv_heads * _config->head_dim * sizeof(float)));
   _v = static_cast<float*>(upload_cuda(_v, _config->n_kv_heads * _config->head_dim * sizeof(float)));
-  _att = static_cast<float*>(upload_cuda(_att, _config->n_heads * _config->max_seq_len * sizeof(float)));
+  _att = static_cast<float*>(upload_cuda(_att, _config->n_heads * _config->max_seq_len * 2 * sizeof(float)));
   register_cuda_host(_logits, _config->vocab_size * sizeof(float));
   _moe_weights = static_cast<float*>(upload_cuda(_moe_weights, _config->n_experts * sizeof(float)));
   _active_experts = static_cast<int*>(upload_cuda(_active_experts, _config->n_experts_active * sizeof(int)));
   _active_experts_weights = static_cast<float*>(upload_cuda(_active_experts_weights, _config->n_experts_active * sizeof(float)));
+}
+
+void InferenceState::cuda_coop() {
+  cuda();
+  _device = Device::CUDA_COOP;
+}
+
+void InferenceState::cuda_cublas() {
+  cuda();
+  _device = Device::CUDA_CUBLAS;
+  libgemm_init(_stream, LibGemmBackend::CUBLAS);
+}
+
+void InferenceState::cuda_cublaslt() {
+  cuda();
+  _device = Device::CUDA_CUBLASLT;
+  libgemm_init(_stream, LibGemmBackend::CUBLASLT);
+}
+
+void InferenceState::cuda_cudnn() {
+  cuda();
+  _device = Device::CUDA_CUDNN;
+  libgemm_init(_stream, LibGemmBackend::CUDNN);
+}
+
+void InferenceState::cuda_cutile() {
+  cuda();
+  _device = Device::CUDA_CUTILE;
+  libgemm_init(_stream, LibGemmBackend::TILE);
 }
 
 Model::Model(YALMData& yalm, int context) {
@@ -414,6 +450,32 @@ void Model::cuda() {
   wcls = upload_cuda(wcls, config->vocab_size * config->dim * weight_size);
 }
 
+void Model::cuda_coop() {
+  cuda();
+  _device = Device::CUDA_COOP;
+  yalm_coop_prepare(*this);
+}
+
+void Model::cuda_cublas() {
+  cuda();
+  _device = Device::CUDA_CUBLAS;
+}
+
+void Model::cuda_cublaslt() {
+  cuda();
+  _device = Device::CUDA_CUBLASLT;
+}
+
+void Model::cuda_cudnn() {
+  cuda();
+  _device = Device::CUDA_CUDNN;
+}
+
+void Model::cuda_cutile() {
+  cuda();
+  _device = Device::CUDA_CUTILE;
+}
+
 void Model::forward(InferenceState& s, int token, int pos, InferenceMode mode) {
   if (s.device() != _device) {
     std::cerr << "FATAL: inference state device mismatch" << std::endl;
@@ -422,9 +484,17 @@ void Model::forward(InferenceState& s, int token, int pos, InferenceMode mode) {
   }
   if (_device == Device::CUDA) {
     _forward_cuda(s, token, pos, mode);
+  } else if (device_uses_libgemm(_device)) {
+    _forward_cuda_lib(s, token, pos, mode);
+  } else if (_device == Device::CUDA_COOP) {
+    _forward_cuda_coop(s, token, pos, mode);
   } else {
     _forward_cpu(s, token, pos, mode);
   }
+}
+
+void Model::_forward_cuda_coop(InferenceState& s, int token, int pos, InferenceMode mode) {
+  yalm_coop_forward(*this, s, token, pos, mode);
 }
 
 #if DEBUG_MODEL

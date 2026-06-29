@@ -34,11 +34,18 @@ LDFLAGS=-lm
 
 CFLAGS+=-fopenmp -mf16c -mavx2 -mfma
 LDFLAGS+=-fopenmp
-LDFLAGS+=-lcudart
+LDFLAGS+=-lcudart -lcublas -lcublasLt
 
 ifneq (,$(wildcard /usr/local/cuda))
   LDFLAGS+=-L/usr/local/cuda/lib64
   CFLAGS+=-I/usr/local/cuda/include
+endif
+
+CUDNN_DIR := $(shell .venv/bin/python -c "import importlib.util; s=importlib.util.find_spec('nvidia.cudnn'); print(s.submodule_search_locations[0] if s and s.submodule_search_locations else '')")
+ifneq ($(CUDNN_DIR),)
+  CFLAGS+=-I$(CUDNN_DIR)/include -DYALM_CUDNN
+  CUFLAGS+=-I$(CUDNN_DIR)/include -DYALM_CUDNN
+  LDFLAGS+=-L$(CUDNN_DIR)/lib -Wl,-rpath,$(CUDNN_DIR)/lib -l:libcudnn.so.9
 endif
 
 CUFLAGS+=-O2 -lineinfo -Ivendor

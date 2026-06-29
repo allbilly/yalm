@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from bench_engines import find_python_with
+
 DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
 PROMPT = "Q: What is the meaning of life?"
 MODEL_GB = 14.48
@@ -17,19 +19,27 @@ PEAK_BW = (4090, 1008), (3080, 760)
 
 BLOG_4090 = {
   "huggingface transformers": ("25.9", "37.2%"),
+  "transformers (torch.compile)": ("—", "—"),
   "llama.cpp": ("61.0", "87.6%"),
   "calm": ("66.0", "94.8%"),
   "yalm": ("63.8", "91.6%"),
+  "vllm": ("—", "—"),
+  "sglang": ("—", "—"),
+  "tensorrt-llm": ("—", "—"),
   "tinygrad": ("—", "—"),
 }
 ENGINE_ORDER = list(BLOG_4090)
 
 PATTERNS = {
   "huggingface transformers": r"throughput:\s*([\d.]+)\s*tok/s",
+  "transformers (torch.compile)": r"throughput:\s*([\d.]+)\s*tok/s",
   "llama.cpp": r"Generation:\s*([\d.]+)\s*t/s",
   "calm": r"tok/s=([\d.]+)",
   "tinygrad": r"([\d.]+)\s*tok/s\s*\(",
   "yalm": r"Generation stats:.*?throughput:\s*([\d.]+)\s*tok/s",
+  "vllm": r"throughput:\s*([\d.]+)\s*tok/s",
+  "sglang": r"throughput:\s*([\d.]+)\s*tok/s",
+  "tensorrt-llm": r"throughput:\s*([\d.]+)\s*tok/s",
 }
 
 
@@ -46,26 +56,59 @@ def run_cmd(cmd: list[str], env: dict[str, str] | None = None, cwd: str | None =
   return p.stdout + p.stderr
 
 
-def bench_subprocess(engine: str, cmd: list[str], runs: int) -> tuple[str, list[float]]:
-  rates = [parse_rate(engine, run_cmd(cmd)) for _ in range(runs)]
+def engine_env(python: Path) -> dict[str, str]:
+  bindir = str(python.parent)
+  path = os.environ.get("PATH", "")
+  return {**os.environ, "PATH": f"{bindir}:{path}" if bindir not in path.split(":") else path}
+
+
+def bench_external_py(engine: str, script: Path, python: Path, model_id: str, count: int,
+                      runs: int) -> tuple[str, list[float]]:
+  cmd = [str(python), str(script), "--model", model_id, "--count", str(count)]
+  env = engine_env(python)
+  rates = [parse_rate(engine, run_cmd(cmd, env=env)) for _ in range(runs)]
   for i, r in enumerate(rates, 1):
     print(f"{engine} run {i}: {r:.2f} tok/s", file=sys.stderr)
   return engine, rates
 
 
-def bench_transformers(model_id: str, count: int) -> tuple[str, list[float]]:
+def bench_subprocess(engine: str, cmd: list[str], runs: int, env: dict[str, str] | None = None) -> tuple[str, list[float]]:
+  rates = [parse_rate(engine, run_cmd(cmd, env=env)) for _ in range(runs)]
+  for i, r in enumerate(rates, 1):
+    print(f"{engine} run {i}: {r:.2f} tok/s", file=sys.stderr)
+  return engine, rates
+
+
+def bench_transformers(model_id: str, count: int, *, torch_compile: bool = True) -> tuple[str, list[float]]:
   import torch
   from transformers import AutoModelForCausalLM, AutoTokenizer
 
+  engine = "transformers (torch.compile)" if torch_compile else "huggingface transformers"
   tok = AutoTokenizer.from_pretrained(model_id)
   model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+  model.eval()
+  if torch_compile:
+    model = torch.compile(model, mode="reduce-overhead")
   inputs = tok([PROMPT], return_tensors="pt").to("cuda")
-  model.generate(**inputs, max_new_tokens=1, do_sample=True)
-  t0 = time.time()
-  out = model.generate(**inputs, max_new_tokens=count, do_sample=True)[0].tolist()
+  gen_kw = dict(max_new_tokens=count, do_sample=True)
+
+  with torch.inference_mode():
+    # Warmup: one token always; extra passes so torch.compile finishes before timing.
+    warmups = 3 if torch_compile else 1
+    for i in range(warmups):
+      model.generate(**inputs, max_new_tokens=min(count, 8 if torch_compile else 1), do_sample=True)
+    if torch_compile:
+      torch.cuda.synchronize()
+    t0 = time.time()
+    out = model.generate(**inputs, **gen_kw)[0].tolist()
+    if torch_compile:
+      torch.cuda.synchronize()
+
   rate = (len(out) - inputs["input_ids"].shape[-1]) / (time.time() - t0)
-  print(f"transformers: {rate:.2f} tok/s", file=sys.stderr)
-  return "huggingface transformers", [rate]
+  print(f"{engine}: {rate:.2f} tok/s", file=sys.stderr)
+  del model, tok, inputs, out
+  torch.cuda.empty_cache()
+  return engine, [rate]
 
 
 def bench_tinygrad(script: Path, python: Path, model: str, count: int, runs: int, beam: int,
@@ -128,6 +171,17 @@ def main() -> None:
   p.add_argument("--calm-bin", default=str(home / "calm/build/run"))
   p.add_argument("--calm-file", default=str(home / ".cache/mistral-7b-instruct.fp16.calm"))
   p.add_argument("--tinygrad-script", default=str(root / "tinygrad_mistral.py"))
+  p.add_argument("--trtllm-script", default=str(root / "trtllm_mistral.py"))
+  p.add_argument("--trtllm-docker", action="store_true",
+                 help="Run tensorrt-llm via trtllm_docker_bench.sh (needs nvidia-container-toolkit)")
+  p.add_argument("--vllm-script", default=str(root / "vllm_mistral.py"))
+  p.add_argument("--sglang-script", default=str(root / "sglang_mistral.py"))
+  p.add_argument("--vllm-python", default=None, help="Python with vllm (auto-detect ~/.cache/uv venvs)")
+  p.add_argument("--sglang-python", default=None, help="Python with sglang (auto-detect ~/.cache/uv venvs)")
+  p.add_argument("--torch-compile", dest="torch_compile", action="store_true", default=True,
+                 help="Use torch.compile(mode='reduce-overhead') for the transformers engine (default: on).")
+  p.add_argument("--no-torch-compile", dest="torch_compile", action="store_false",
+                 help="Run transformers in eager mode.")
   args = p.parse_args()
 
   weights = Path(args.weights).expanduser() if args.weights else None
@@ -139,7 +193,12 @@ def main() -> None:
   results: dict[str, list[float]] = {}
 
   if "huggingface transformers" in want:
-    results["huggingface transformers"] = bench_transformers(model_id, args.count)[1]
+    label = "transformers (torch.compile)" if args.torch_compile else "huggingface transformers"
+    if label in results:
+      print(f"skip {label}: already ran with the other torch_compile setting", file=sys.stderr)
+    else:
+      results[label] = bench_transformers(model_id, args.count, torch_compile=args.torch_compile)[1]
+
 
   for engine, paths, cmd in [
     ("yalm", (args.yalm_bin, args.yalm_ckpt),
@@ -166,6 +225,47 @@ def main() -> None:
           Path(args.tinygrad_script), Path(args.python), args.model, args.count, args.runs, args.beam, weights)[1]
       except ImportError:
         print("skip tinygrad: pip install tinygrad", file=sys.stderr)
+
+  if "tensorrt-llm" in want:
+    script = Path(args.trtllm_script)
+    docker_sh = root / "trtllm_docker_bench.sh"
+    if not script.exists():
+      print(f"skip tensorrt-llm: missing {script}", file=sys.stderr)
+    elif args.trtllm_docker:
+      if not docker_sh.exists():
+        print(f"skip tensorrt-llm: missing {docker_sh}", file=sys.stderr)
+      else:
+        cmd = [str(docker_sh), "--model", model_id, "--count", str(args.count)]
+        results["tensorrt-llm"] = bench_subprocess("tensorrt-llm", cmd, 1)[1]
+    else:
+      try:
+        import tensorrt_llm  # noqa: F401
+        cmd = [str(args.python), str(script), "--model", model_id, "--count", str(args.count)]
+        results["tensorrt-llm"] = bench_subprocess("tensorrt-llm", cmd, 1)[1]
+      except ImportError:
+        if docker_sh.exists():
+          print("tensorrt-llm: no native install; trying Docker", file=sys.stderr)
+          cmd = [str(docker_sh), "--model", model_id, "--count", str(args.count)]
+          results["tensorrt-llm"] = bench_subprocess("tensorrt-llm", cmd, 1)[1]
+        else:
+          print("skip tensorrt-llm: pip install or use --trtllm-docker (see requirements-trtllm.txt)", file=sys.stderr)
+
+  for engine, script_arg, pkg, py_arg in [
+    ("vllm", args.vllm_script, "vllm", args.vllm_python),
+    ("sglang", args.sglang_script, "sglang", args.sglang_python),
+  ]:
+    if engine not in want:
+      continue
+    script = Path(script_arg)
+    if not script.exists():
+      print(f"skip {engine}: missing {script}", file=sys.stderr)
+      continue
+    python = Path(py_arg) if py_arg else find_python_with(pkg)
+    if not python:
+      print(f"skip {engine}: no Python with {pkg} (see requirements-{engine}.txt)", file=sys.stderr)
+      continue
+    print(f"{engine}: using {python}", file=sys.stderr)
+    results[engine] = bench_external_py(engine, script, python, model_id, args.count, 1)[1]
 
   if not results:
     p.error("no engines ran (check paths and --engines)")
