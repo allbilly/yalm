@@ -17,3 +17,9 @@ perf.data*
 *.gputrace/
 **/.DS_Store
 
+ref/smoke/.deps/
+.containers/
+ref/tg_kernels/*.log
+ref/tg_kernels/*.pid
+ref/bench_run.log
+ref/bench_run.pid

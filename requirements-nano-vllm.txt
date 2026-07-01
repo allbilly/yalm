@@ -1,0 +1,7 @@
+# nano-vllm (Python 3.10–3.12 only). Install into ref/nano-vllm/.venv:
+#   uv venv --clear --python 3.12 ref/nano-vllm/.venv
+#   uv pip install --python ref/nano-vllm/.venv/bin/python torch --index-url https://download.pytorch.org/whl/cu124
+#   uv pip install --python ref/nano-vllm/.venv/bin/python psutil ninja packaging wheel
+#   uv pip install --python ref/nano-vllm/.venv/bin/python flash-attn --no-build-isolation
+#   uv pip install --python ref/nano-vllm/.venv/bin/python -e ref/nano-vllm --no-deps
+#   uv pip install --python ref/nano-vllm/.venv/bin/python transformers triton xxhash safetensors

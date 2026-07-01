@@ -5,15 +5,52 @@ Llama Transformer vendored from tinygrad extra/models/llama.py (MIT).
 """
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Union
 
 from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device, Context
 from tinygrad.nn.state import load_state_dict, safe_load
+from tinygrad.helpers import getenv
 
 DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
 
+def _cb(x: Tensor) -> Tensor:
+  """contiguous_backward() blocks scheduler fusion; skip for fp16 inference (NO_CB=1)."""
+  return x if getenv("NO_CB", 1) else x.contiguous_backward()
+
+def merge_fused_weights(model: "Transformer") -> None:
+  """Legacy no-op: fusion is done in fuse_state_dict before load."""
+  pass
+
+def _pack_wqkv(wq: Tensor, wk: Tensor, wv: Tensor, n_heads: int, n_kv_heads: int) -> Tensor:
+  """Interleave Q/K/V per KV head: (n_kv, n_rep+2, head_dim, dim) — not flat [Q;K;V]."""
+  head_dim = wq.shape[0] // n_heads
+  n_rep = n_heads // n_kv_heads
+  dim = wq.shape[1]
+  wq = wq.reshape(n_kv_heads, n_rep, head_dim, dim)
+  wk = wk.reshape(n_kv_heads, 1, head_dim, dim)
+  wv = wv.reshape(n_kv_heads, 1, head_dim, dim)
+  wqkv = Tensor.cat(wq, wk, wv, dim=1).reshape(n_kv_heads * (n_rep + 2) * head_dim, dim)
+  if getenv("CHECK_QKV", 0):
+    packed = wqkv.reshape(n_kv_heads, n_rep + 2, head_dim, dim)
+    assert (packed[:, :n_rep].reshape(*wq.shape) - wq).abs().max().item() < 1e-5
+    assert (packed[:, n_rep:n_rep + 1] - wk).abs().max().item() < 1e-5
+    assert (packed[:, n_rep + 1:] - wv).abs().max().item() < 1e-5
+  return wqkv
+
+def fuse_state_dict(sd: dict[str, Tensor], n_layers: int, n_heads: int, n_kv_heads: int) -> dict[str, Tensor]:
+  if getenv("FUSE_QKV", 1):
+    for l in range(n_layers):
+      p = f"layers.{l}.attention."
+      wq, wk, wv = sd.pop(p + "wq.weight"), sd.pop(p + "wk.weight"), sd.pop(p + "wv.weight")
+      sd[p + "wqkv.weight"] = _pack_wqkv(wq, wk, wv, n_heads, n_kv_heads)
+  if getenv("FUSE_GLU", 1):
+    for l in range(n_layers):
+      p = f"layers.{l}.feed_forward."
+      sd[p + "w13.weight"] = Tensor.cat(sd.pop(p + "w1.weight"), sd.pop(p + "w3.weight"), dim=0)
+  return sd
 
 def mistral_weights_dir(model_id: str = DEFAULT_MODEL, local_dir: str | Path | None = None) -> Path:
   import os
@@ -54,15 +91,25 @@ class Attention:
     self.head_dim = dim // n_heads
     self.n_rep = n_heads // n_kv_heads
     self.max_context = max_context
-    self.wq = linear(dim, n_heads * self.head_dim, bias=False)
-    self.wk = linear(dim, n_kv_heads * self.head_dim, bias=False)
-    self.wv = linear(dim, n_kv_heads * self.head_dim, bias=False)
+    if getenv("FUSE_QKV", 1):
+      self.wqkv = linear(dim, n_heads * self.head_dim + n_kv_heads * self.head_dim * 2, bias=False)
+    else:
+      self.wq = linear(dim, n_heads * self.head_dim, bias=False)
+      self.wk = linear(dim, n_kv_heads * self.head_dim, bias=False)
+      self.wv = linear(dim, n_kv_heads * self.head_dim, bias=False)
     self.wo = linear(n_heads * self.head_dim, dim, bias=False)
 
   def __call__(self, x: Tensor, start_pos: Union[Variable, int], freqs_cis: Tensor, mask: Tensor | None) -> Tensor:
-    xq, xk, xv = self.wq(x), self.wk(x.contiguous_backward()), self.wv(x)
+    if hasattr(self, "wqkv"):
+      xqkv = self.wqkv(x)
+      xqkv = xqkv.reshape(xqkv.shape[0], xqkv.shape[1], self.n_kv_heads, self.n_rep + 2, self.head_dim)
+      xq = xqkv[:, :, :, :self.n_rep].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+      xk = xqkv[:, :, :, self.n_rep:self.n_rep + 1].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+      xv = xqkv[:, :, :, self.n_rep + 1:self.n_rep + 2].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+    else:
+      xq, xk, xv = self.wq(x), self.wk(_cb(x)), self.wv(x)
     if x.dtype == dtypes.bfloat16:
-      xq, xk = xq.contiguous_backward(), xk.contiguous_backward()
+      xq, xk = _cb(xq), _cb(xk)
     xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
     xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
     xv = xv.reshape(xv.shape[0], xv.shape[1], self.n_kv_heads, self.head_dim)
@@ -71,7 +118,9 @@ class Attention:
 
     if not hasattr(self, "cache_kv"):
       self.cache_kv = Tensor.zeros(2, bsz, self.max_context, self.n_kv_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
-    self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :].assign(Tensor.stack(xk, xv)).realize()
+    self.cache_kv[:, :, start_pos:start_pos + seqlen, :, :].assign(Tensor.stack(xk, xv))
+    if getenv("KV_REALIZE", 0):
+      self.cache_kv.realize()
     keys = self.cache_kv[0, :, :start_pos+seqlen, :, :]
     values = self.cache_kv[1, :, :start_pos+seqlen, :, :]
     keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
@@ -81,12 +130,20 @@ class Attention:
 
 class FeedForward:
   def __init__(self, dim: int, hidden_dim: int, linear=nn.Linear):
-    self.w1 = linear(dim, hidden_dim, bias=False)
+    if getenv("FUSE_GLU", 1):
+      self.w13 = linear(dim, hidden_dim * 2, bias=False)
+    else:
+      self.w1 = linear(dim, hidden_dim, bias=False)
+      self.w3 = linear(dim, hidden_dim, bias=False)
     self.w2 = linear(hidden_dim, dim, bias=False)
-    self.w3 = linear(dim, hidden_dim, bias=False)
+    self.hidden_dim = hidden_dim
 
   def __call__(self, x: Tensor) -> Tensor:
-    return self.w2(self.w1(x).silu() * self.w3(x.contiguous_backward()))
+    if hasattr(self, "w13"):
+      h = self.w13(x)
+      w1, w3 = h[..., :self.hidden_dim], h[..., self.hidden_dim:]
+      return self.w2(w1.silu() * w3)
+    return self.w2(self.w1(x).silu() * self.w3(_cb(x)))
 
 class TransformerBlock:
   def __init__(self, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear=nn.Linear):
@@ -97,7 +154,8 @@ class TransformerBlock:
 
   def __call__(self, x: Tensor, start_pos: Union[Variable, int], freqs_cis: Tensor, mask: Tensor | None):
     h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-    return (h + self.feed_forward(self.ffn_norm(h))).contiguous().contiguous_backward()
+    out = h + self.feed_forward(self.ffn_norm(h))
+    return _cb(out) if getenv("BLOCK_CB", 0) else out
 
 def sample(logits: Tensor, temp: float) -> Tensor:
   if temp < 1e-6:
@@ -122,7 +180,7 @@ class Transformer:
       if tokens.shape[1] > 1 else None
     for layer in self.layers:
       h = layer(h, start_pos, freqs_cis, mask)
-    logits = self.output(self.norm(h).contiguous().contiguous_backward()).contiguous_backward()
+    logits = self.output(_cb(self.norm(h)))
     return sample(logits[:, -1, :].flatten(), temperature)
 
   def __call__(self, tokens: Tensor, start_pos: int, temperature: float = 0.0):
@@ -175,15 +233,24 @@ def main() -> None:
   p.add_argument("--prompt", default="Q: What is the meaning of life?")
   p.add_argument("--model", default=DEFAULT_MODEL)
   p.add_argument("--weights", default=None)
+  p.add_argument("--no-fuse", action="store_true", help="Disable FUSE_QKV/FUSE_GLU/NO_CB")
   args = p.parse_args()
+  if args.no_fuse:
+    os.environ["FUSE_QKV"] = "0"
+    os.environ["FUSE_GLU"] = "0"
+    os.environ["NO_CB"] = "0"
+    os.environ["BLOCK_CB"] = "1"
+    os.environ["KV_REALIZE"] = "1"
   weights_dir = mistral_weights_dir(args.model, local_dir=args.weights)
 
   raw = load_hf_weights(str(weights_dir / "model.safetensors.index.json"))
   weights = {k: v.cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k, v in
              convert_from_huggingface(raw, 32, 32, 8).items()}
+  weights = fuse_state_dict(weights, 32, 32, 8)
   model = Transformer(4096, 14336, 32, 32, 1e-5, 32000, 8, 1000000, 4096)
   with Context(BEAM=0):
     load_state_dict(model, weights, strict=False, consume=True)
+  print(f"fusion: FUSE_QKV={getenv('FUSE_QKV', 1)} FUSE_GLU={getenv('FUSE_GLU', 1)} NO_CB={getenv('NO_CB', 1)}", flush=True)
 
   from sentencepiece import SentencePieceProcessor
   spp = SentencePieceProcessor(model_file=str(weights_dir / "tokenizer.model"))

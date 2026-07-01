@@ -7,6 +7,13 @@ from pathlib import Path
 
 
 def find_python_with(pkg: str) -> Path | None:
+  local = {
+    "nanovllm": Path(__file__).resolve().parent / "ref/nano-vllm/.venv/bin/python",
+  }
+  if (py := local.get(pkg)) and py.is_file():
+    r = subprocess.run([str(py), "-c", f"import {pkg}"], capture_output=True)
+    if r.returncode == 0:
+      return py
   roots = [
     Path.home() / ".cache/uv/environments-v2",
     Path.home() / ".cache/uv/environments-v2/vllm-bench",

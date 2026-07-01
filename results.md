@@ -826,7 +826,18 @@ Linear layers (QKV, WO, FFN, LM head) use library GEMM; attention/RoPE/norm
 stay on custom kernels. No CUDA graph (cuBLAS + graph capture is awkward on
 Ampere). Activations are cast f32→f16 before GemmEx (llama.cpp pattern).
 
-**Short decode (120 tok, RTX 3080):**
+**Serving runtimes (external, 4k context, RTX 3080, 120 decode):**
+
+| Engine | tok/s | 3080 % peak BW | Notes |
+|--------|------:|---------------:|-------|
+| vLLM 0.23.0 (no spec decode) | **43.5** | 82.8% | `speculative_config=None`, actual token count |
+| SGLang 0.5.9 | **45.5** | 86.7% | `sglang_mistral.py`, graph warmup before timing |
+| yalm `-d cuda` | **~49** | ~93% | same run as §28 table |
+| tensorrt-llm | — | — | **43.3** (4k ctx) | `./trtllm_docker_bench.sh`, `kv_cache_fraction=0.15` |
+
+Install: `requirements-vllm.txt`, `requirements-sglang.txt`, `requirements-trtllm.txt`. vLLM bench uses `--ignore-eos` + actual token count for parity with `-n 120`; enable speculative decoding separately via `--spec-decode` when a draft model is configured.
+
+**Short decode — library backends (120 tok, RTX 3080):**
 
 | Backend | tok/s |
 |---------|------:|
@@ -835,13 +846,4 @@ Ampere). Activations are cast f32→f16 before GemmEx (llama.cpp pattern).
 | `-d cuda-cublaslt` | **~43** (Lt matvec n=1 falls back to GemmEx on 3080) |
 | `-d cuda-cudnn` | **~43** (cuDNN graph matmul; cuBLAS fallback if plan fails) |
 | `-d cuda-cutile` | **~45** (warp-tile matvec kernel) |
-| `-d tensorrt-llm` | external TRT-LLM runtime (see `trtllm_mistral.py`) |
-
-**Serving runtimes (external, 4k context, RTX 3080):**
-
-| Engine | Script | Install |
-|--------|--------|---------|
-| vLLM | `vllm_mistral.py` | `requirements-vllm.txt` (+ `ninja` for FlashInfer JIT) |
-| SGLang | `sglang_mistral.py` | `requirements-sglang.txt` (Python 3.12 uv venv) |
-
-Custom kernels remain faster: library paths pay per-layer launch + f32→f16 conversion (cuBLAS/cuDNN) without yalm's fused QKV/FFN kernels.
+| `-d tensorrt-llm` | external TRT-LLM runtime (see `trtllm_docker_bench.sh`) |
